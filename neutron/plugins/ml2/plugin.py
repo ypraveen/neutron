@@ -1196,6 +1196,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         need_port_update_notify = False
         session = context.session
         bound_mech_contexts = []
+        addr_pairs = []
 
         with db_api.exc_to_retry(os_db_exception.DBDuplicateEntry),\
                 session.begin(subtransactions=True):
@@ -1266,11 +1267,14 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                 self.mechanism_manager.update_port_precommit(mech_context)
                 bound_mech_contexts.append(mech_context)
 
+        if addr_pair.ADDRESS_PAIRS in attrs:
+            addr_pairs = self.get_allowed_address_pairs(context, id)
         # Notifications must be sent after the above transaction is complete
         kwargs = {
             'context': context,
             'port': updated_port,
             'mac_address_updated': mac_address_updated,
+            'address_pairs': addr_pairs,
             'original_port': original_port,
         }
         registry.notify(resources.PORT, events.AFTER_UPDATE, self, **kwargs)
@@ -1383,6 +1387,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
         self._pre_delete_port(context, id, l3_port_check)
         # TODO(armax): get rid of the l3 dependency in the with block
         router_ids = []
+        addr_pairs = []
         l3plugin = manager.NeutronManager.get_service_plugins().get(
             service_constants.L3_ROUTER_NAT)
 
@@ -1393,6 +1398,7 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
                 LOG.debug("The port '%s' was deleted", id)
                 return
             port = self._make_port_dict(port_db)
+            addr_pairs = self.get_allowed_address_pairs(context, port['id'])
 
             network = self.get_network(context, port['network_id'])
             bound_mech_contexts = []
@@ -1422,13 +1428,14 @@ class Ml2Plugin(db_base_plugin_v2.NeutronDbPluginV2,
             super(Ml2Plugin, self).delete_port(context, id)
 
         self._post_delete_port(
-            context, port, router_ids, bound_mech_contexts)
+            context, port, router_ids, bound_mech_contexts, addr_pairs)
 
     def _post_delete_port(
-        self, context, port, router_ids, bound_mech_contexts):
+        self, context, port, router_ids, bound_mech_contexts, addr_pairs):
         kwargs = {
             'context': context,
             'port': port,
+            'address_pairs': addr_pairs,
             'router_ids': router_ids,
         }
         registry.notify(resources.PORT, events.AFTER_DELETE, self, **kwargs)

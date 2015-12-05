@@ -689,7 +689,18 @@ class L3_NAT_with_dvr_db_mixin(l3_db.L3_NAT_db_mixin,
         return (n_utils.is_dvr_serviced(port_dict['device_owner']) and
                 port_dict['fixed_ips'])
 
-    def update_arp_entry_for_dvr_service_port(self, context, port_dict):
+    def get_port_fixed_and_allowed_address_pair_ips(self, port_dict):
+        ips = port_dict['fixed_ips']
+        if isinstance(port_dict.get('allowed_address_pairs', None), list):
+            for address_pair in port_dict['allowed_address_pairs']:
+                aap_ip_cidr = address_pair['ip_address'].split("/")
+                if len(aap_ip_cidr) == 1 or int(aap_ip_cidr[1]) == 32:
+                    ips.append(aap_ip_cidr[0])
+        return ips
+
+
+    def update_arp_entry_for_dvr_service_port(
+        self, context, port_dict):
         """Notify L3 agents of ARP table entry for dvr service port.
 
         When a dvr service port goes up, look for the DVR router on
@@ -698,13 +709,14 @@ class L3_NAT_with_dvr_db_mixin(l3_db.L3_NAT_db_mixin,
         """
         if not self._should_update_arp_entry_for_dvr_service_port(port_dict):
             return
-        changed_fixed_ips = port_dict['fixed_ips']
-        for fixed_ip in changed_fixed_ips:
+        changed_ips = get_port_fixed_and_allowed_address_pair_ips(port_dict)
+        for ip in changed_ips:
             self._generate_arp_table_and_notify_agent(
-                context, fixed_ip, port_dict['mac_address'],
+                context, ip, port_dict['mac_address'],
                 self.l3_rpc_notifier.add_arp_entry)
 
-    def delete_arp_entry_for_dvr_service_port(self, context, port_dict):
+    def delete_arp_entry_for_dvr_service_port(
+        self, context, port_dict, ips_to_delete=[]):
         """Notify L3 agents of ARP table entry for dvr service port.
 
         When a dvr service port goes down, look for the DVR
@@ -713,10 +725,12 @@ class L3_NAT_with_dvr_db_mixin(l3_db.L3_NAT_db_mixin,
         """
         if not self._should_update_arp_entry_for_dvr_service_port(port_dict):
             return
-        changed_fixed_ips = port_dict['fixed_ips']
-        for fixed_ip in changed_fixed_ips:
+        if not ips_to_delete:
+            ips_to_delete = get_port_fixed_and_allowed_address_pair_ips(
+                port_dict)
+        for ip in ips_to_delete:
             self._generate_arp_table_and_notify_agent(
-                context, fixed_ip, port_dict['mac_address'],
+                context, ip, port_dict['mac_address'],
                 self.l3_rpc_notifier.del_arp_entry)
 
     def delete_csnat_router_interface_ports(self, context,
@@ -792,6 +806,91 @@ class L3_NAT_with_dvr_db_mixin(l3_db.L3_NAT_db_mixin,
     def delete_floatingip(self, context, id):
         floating_ip = self._delete_floatingip(context, id)
         self._notify_floating_ip_change(context, floating_ip)
+
+    def _get_address_pair_active_port_with_fip(
+            self, context, port_dict, port_addr_pair_ip):
+        port_valid_state = (port_dict['admin_state_up'] or
+            (port_dict['status'] == l3_const.PORT_STATUS_ACTIVE))
+        if not port_valid_state:
+            return None
+        filters = {'fixed_ips': {'ip_address': [port_addr_pair_ip]}}
+        ports = self._core_plugin.get_ports(context, filters=filters)
+        for port in ports:
+            #check if paired port has associated fip.
+            #if so, go ahead updating host and device info
+            fip = self._get_floatingip_on_port(context,
+                                               port_id=port['id'])
+            if not fip:
+                continue
+            for ip in port['fixed_ips']:
+                if ip['ip_address'] == port_addr_pair_ip:
+                    return port
+        return None
+
+    def update_unbound_allowed_address_pair_port_binding(
+            self, context, service_port_dict,
+            port_address_pairs):
+        """Update allowed address pair port with host and device_owner
+
+        This function sets the host and device_owner to the port
+        associated with the port_addr_pair_ip with the port_dict's
+        host and device_owner.
+        """
+        port_addr_pair_ip = port_address_pairs['ip_address']
+        address_pair_port = (
+            self._get_address_pair_active_port_with_fip(
+                context, service_port_dict, port_addr_pair_ip))
+        if address_pair_port:
+            host = service_port_dict[portbindings.HOST_ID]
+            dev_owner = service_port_dict['device_owner']
+            address_pair_dev_owner = address_pair_port.get('device_owner')
+            # If the allowed_address_pair port already has an associated
+            # device owner, and if the device_owner is a dvr serviceable
+            # port, then don't update the device_owner.
+            port_profile = address_pair_port.get(portbindings.PROFILE)
+            if n_utils.is_dvr_serviced(address_pair_dev_owner):
+                if not port_profile:
+                    port_profile = {
+                        'original_owner': address_pair_dev_owner}
+                else:
+                    port_profile['original_owner'] = address_pair_dev_owner
+                port_data = {portbindings.HOST_ID: host,
+                             portbindings.PROFILE: port_profile}
+            else:
+                port_data = {portbindings.HOST_ID: host,
+                             'device_owner': dev_owner}
+            update_port = self._core_plugin.update_port(
+                context, address_pair_port['id'], {'port': port_data})
+            return update_port
+        return None
+
+    def remove_unbound_allowed_address_pair_port_binding(
+            self, context, service_port_dict,
+            port_address_pairs):
+        """Remove allowed address pair port binding and device_owner
+
+        This function clears the host and device_owner associated with
+        the port_addr_pair_ip.
+        """
+        port_addr_pair_ip = port_address_pairs['ip_address']
+        address_pair_port = (
+            self._get_address_pair_active_port_with_fip(
+                context, service_port_dict, port_addr_pair_ip))
+        if address_pair_port:
+            # Before reverting the changes, fetch the original
+            # device owner saved in profile and update the port
+            port_profile = address_pair_port.get(portbindings.PROFILE)
+            orig_device_owner = ""
+            if port_profile:
+                orig_device_owner = port_profile.get('original_owner')
+                del port_profile['original_owner']
+            port_data = {portbindings.HOST_ID: "",
+                         'device_owner': orig_device_owner,
+                         portbindings.PROFILE: port_profile}
+            update_port = self._core_plugin.update_port(
+                context, address_pair_port['id'], {'port': port_data})
+            return update_port
+        return None
 
 
 def is_distributed_router(router):

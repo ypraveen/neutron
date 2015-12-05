@@ -946,11 +946,13 @@ class TestMl2DvrPortsV2(TestMl2PortsV2):
             self.assertEqual(2, notify.call_count)
             # needed for a full match in the assertion below
             port['port']['extra_dhcp_opts'] = []
+            address_pairs = []
             expected = [mock.call(resources.PORT, events.BEFORE_DELETE,
                                   mock.ANY, context=self.context,
                                   port_id=port['port']['id'], port_check=True),
                         mock.call(resources.PORT, events.AFTER_DELETE,
-                                  mock.ANY, context=self.context,
+                                  mock.ANY, address_pairs=address_pairs,
+                                  context=self.context,
                                   port=port['port'],
                                   router_ids=router_ids)]
             notify.assert_has_calls(expected)
@@ -1963,6 +1965,7 @@ class TestMl2PluginCreateUpdateDeletePort(base.BaseTestCase):
             kwargs = {
                 'context': self.context,
                 'port': updated_port,
+                'address_pairs': [],
                 'mac_address_updated': True,
                 'original_port': original_port,
             }
